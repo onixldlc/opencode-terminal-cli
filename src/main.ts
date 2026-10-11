@@ -5,6 +5,9 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Database } from "bun:sqlite";
+// bun embeds this at compile time, and CI rewrites the version from VERSION
+// before building, so the binary reports the release it was cut from
+import pkg from "../package.json";
 
 const BIN_NAME = "opencode-terminal-cli";
 const CONFIG_DIR = process.env.OPENCODE_TERMINAL_CONFIG_DIR || join(homedir(), ".config", "opencode-terminal-cli");
@@ -290,6 +293,7 @@ Usage:
   ${BIN_NAME} --read-only          Mount cwd read-only
   ${BIN_NAME} -i, --shell          Drop into interactive bash inside container
   ${BIN_NAME} -h, --help           Show this help
+  ${BIN_NAME} --cli-version        Print this wrapper's own version
   ${BIN_NAME} --config             Print config file path and current values
   ${BIN_NAME} --edit-config        Open config in $EDITOR
   ${BIN_NAME} [...args]            Pass extra args to opencode (e.g. --version, models, stats)
@@ -386,10 +390,17 @@ async function main() {
 
   if (argv.includes("-h") || argv.includes("--help")) { printHelp(); return; }
 
+  // --version belongs to opencode; this one reports the wrapper
+  if (argv.includes("--cli-version")) {
+    console.log(`${BIN_NAME} ${pkg.version}`);
+    return;
+  }
+
   const cfg = loadConfig();
   const cwd = process.cwd();
 
   if (argv.includes("--config")) {
+    console.log(`${BIN_NAME} ${pkg.version}`);
     console.log(`config file: ${CONFIG_FILE}`);
     console.log(JSON.stringify(cfg, null, 2));
     return;

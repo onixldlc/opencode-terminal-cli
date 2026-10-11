@@ -47,6 +47,7 @@ opencode-terminal-cli --read-only          # mount cwd read-only
 opencode-terminal-cli -i                   # interactive bash inside container (debug, plugin install)
 opencode-terminal-cli --shell              # alias for -i
 opencode-terminal-cli --version            # passes --version to opencode
+opencode-terminal-cli --cli-version        # this wrapper's own version
 opencode-terminal-cli --help               # this help
 opencode-terminal-cli --config             # show current config
 opencode-terminal-cli --edit-config        # open config in $EDITOR
@@ -174,15 +175,15 @@ That is this wrapper's own config dir — not opencode's `OPENCODE_CONFIG_DIR`.
 
 The **major** tracks [llm-terminal-cli](https://github.com/onixldlc/llm-terminal-cli) — currently `0.x` (`v0.2.4` released), so this starts at `0.2.0`. Minor and patch are this repo's own: they are fixes against opencode, and those don't translate one-to-one to the claude wrapper.
 
-`VERSION` holds the bare number (`0.2.0`); the tag and release it produces are `v`-prefixed (`v0.2.0`).
+`VERSION` holds the tag verbatim, `v` included — currently `v0.2.0`. A rebuild of the same code gets a revision written straight into the file (`v0.2.0-r2`). `package.json` cannot carry a `v`, so both workflows rewrite its `version` from `VERSION` (minus the prefix) before building. `src/main.ts` imports it and bun embeds it at compile time, so `--cli-version` on a released binary reports the release it was cut from; the release workflow asserts that. The committed `package.json` value is just a placeholder — `VERSION` is the single source.
 
 ## Releasing
 
 No `git tag` needed. Edit **`VERSION`** on `main` and the push builds all five binaries, then creates the tag and release with checksums.
 
 ```bash
-echo 0.2.1 > VERSION
-git commit -am "release 0.2.1" && git push
+echo v0.2.1 > VERSION
+git commit -am "release v0.2.1" && git push
 ```
 
 Build without releasing: Actions → Build and Release → Run workflow → untick **publish**.

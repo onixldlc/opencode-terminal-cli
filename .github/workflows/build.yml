@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version override (e.g. 0.2.1). Empty = read the VERSION file.'
+        description: 'Version override (e.g. v0.2.1 or v0.2.0-r2). Empty = read the VERSION file.'
         required: false
         default: ''
       publish:
@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      npm_version: ${{ steps.version.outputs.npm_version }}
       publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +45,8 @@ jobs:
             exit 1
           fi
 
-          # The file holds the bare number; tags are v-prefixed.
+          # The file carries the v itself (v0.2.0), optionally with a rebuild
+          # revision (v0.2.0-r2). A bare input still gets the prefix.
           [[ "${VERSION}" == v* ]] || VERSION="v${VERSION}"
 
           # Git refs allow a narrow character set; sanitise rather than fail.
@@ -58,8 +60,9 @@ jobs:
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "npm_version=${VERSION#v}" >> "$GITHUB_OUTPUT"
           echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION} publish=${PUBLISH}"
+          echo "version=${VERSION} npm_version=${VERSION#v} publish=${PUBLISH}"
 
   build:
     name: Build ${{ matrix.target }}
@@ -89,6 +92,18 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Sync package.json version
+        # package.json cannot carry the v, so VERSION is the single source and
+        # this strips it. Only the checkout is touched; the committed file stays
+        # whatever it is.
+        env:
+          NPM_VERSION: ${{ needs.determine-version.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          jq --arg v "${NPM_VERSION}" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          grep '"version"' package.json
+
       - name: Install deps
         run: bun install
 
@@ -102,10 +117,15 @@ jobs:
         # Only the native target can run on the runner; the others are proven by
         # the compile step alone.
         if: matrix.target == 'linux-x64'
+        env:
+          NPM_VERSION: ${{ needs.determine-version.outputs.npm_version }}
         run: |
           chmod +x dist/${{ matrix.artifact }}
           ./dist/${{ matrix.artifact }} --help
           ./dist/${{ matrix.artifact }} --config
+          # proves the version synced from VERSION reached the binary
+          test "$(./dist/${{ matrix.artifact }} --cli-version)" = "opencode-terminal-cli ${NPM_VERSION}"
+          echo "binary reports ${NPM_VERSION}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
