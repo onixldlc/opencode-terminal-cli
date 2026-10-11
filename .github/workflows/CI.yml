@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        run: bun install
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Smoke build (linux-x64)
+        run: bun run build:linux-x64
+
+      - name: Verify binary
+        run: |
+          chmod +x dist/opencode-terminal-cli-linux-x64
+          ./dist/opencode-terminal-cli-linux-x64 --help

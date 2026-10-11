@@ -1,0 +1,27 @@
+{
+  "name": "opencode-terminal-cli",
+  "version": "0.2.0",
+  "description": "CLI wrapper for running opencode in a container (docker/podman)",
+  "type": "module",
+  "bin": {
+    "opencode-terminal-cli": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "build": "bun build ./src/main.ts --compile --outfile dist/opencode-terminal-cli",
+    "build:linux-x64": "bun build ./src/main.ts --compile --target=bun-linux-x64 --outfile dist/opencode-terminal-cli-linux-x64",
+    "build:linux-arm64": "bun build ./src/main.ts --compile --target=bun-linux-arm64 --outfile dist/opencode-terminal-cli-linux-arm64",
+    "build:darwin-x64": "bun build ./src/main.ts --compile --target=bun-darwin-x64 --outfile dist/opencode-terminal-cli-darwin-x64",
+    "build:darwin-arm64": "bun build ./src/main.ts --compile --target=bun-darwin-arm64 --outfile dist/opencode-terminal-cli-darwin-arm64",
+    "build:windows-x64": "bun build ./src/main.ts --compile --target=bun-windows-x64 --outfile dist/opencode-terminal-cli-windows-x64.exe",
+    "build:all": "bun run build:linux-x64 && bun run build:linux-arm64 && bun run build:darwin-x64 && bun run build:darwin-arm64 && bun run build:windows-x64",
+    "install-local": "bun run build && install -m 755 dist/opencode-terminal-cli ~/.local/bin/opencode-terminal-cli && echo 'installed to ~/.local/bin/opencode-terminal-cli'"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "latest"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
