@@ -288,6 +288,7 @@ Usage:
   ${BIN_NAME} --system-prompt <s>  Extra system prompt text for this run
   ${BIN_NAME} --system-prompt-file <f>
                                    Extra system prompt file for this run
+  ${BIN_NAME} --login [provider]   Log in once; the credential persists in config_dir
   ${BIN_NAME} --web [port]         Run \`opencode web\` and publish the port (default 4096)
   ${BIN_NAME} --secure             Don't mount cwd + least privilege (config still mounted)
   ${BIN_NAME} --read-only          Mount cwd read-only
@@ -311,9 +312,12 @@ Session tracking:
   config_dir/.local/share/opencode/opencode.db and resumed with 'opencode -s <id>'.
 
 Auth:
-  ZHIPU_API_KEY is forwarded when set — it covers zai, zai-coding-plan, zhipuai
-  and zhipuai-coding-plan. Otherwise run '/connect' in the TUI once; credentials
-  persist in config_dir/.local/share/opencode/auth.json.
+  Either forward a key or log in once — you don't need both.
+  ZHIPU_API_KEY is forwarded when set; it covers zai, zai-coding-plan, zhipuai
+  and zhipuai-coding-plan. The one-off alternative is '${BIN_NAME} --login zai'
+  (or '/connect' in the TUI), which stores the credential in the 'credential'
+  table of config_dir/.local/share/opencode/opencode.db — a mounted host path,
+  so every later run already has it and no -e is needed again.
 
 Config file: ${CONFIG_FILE}
 Default host config dir: ${DEFAULT_CONFIG.config_dir}
@@ -450,6 +454,17 @@ async function main() {
     setLastSessionId(cfg, cwd, resolved);
     const rest = argv.filter((_, i) => i !== sessionsIdx && i !== sessionsIdx + 1);
     run(buildRunArgs({ ...shared, interactive: false, opencodeArgs: ["-s", resolved, ...rest] }));
+  }
+
+  // --login [provider]: hand over to opencode's interactive login. The container
+  // already mounts the data dir, so the stored credential outlives it.
+  const loginIdx = argv.indexOf("--login");
+  if (loginIdx !== -1) {
+    const next = argv[loginIdx + 1];
+    const provider = next && !next.startsWith("-") ? next : undefined;
+    const opencodeArgs = ["auth", "login"];
+    if (provider) opencodeArgs.push("--provider", provider);
+    run(buildRunArgs({ ...shared, interactive: false, opencodeArgs }));
   }
 
   // --web [port]: serve the web UI instead of the TUI, publishing the port

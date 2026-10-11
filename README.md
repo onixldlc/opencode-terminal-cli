@@ -41,6 +41,7 @@ opencode-terminal-cli --sessions <id>      # resume specific session (id or pref
 opencode-terminal-cli --model zai/glm-4.7  # model for this run
 opencode-terminal-cli --system-prompt "…"  # extra system prompt for this run
 opencode-terminal-cli --system-prompt-file ./reviewer.md
+opencode-terminal-cli --login zai          # log in once, no -e needed afterwards
 opencode-terminal-cli --web 5000           # run `opencode web`, publish the port
 opencode-terminal-cli --secure             # don't mount cwd + least privilege (config still mounted)
 opencode-terminal-cli --read-only          # mount cwd read-only
@@ -105,14 +106,24 @@ in `config_dir/sessions.json`.
 
 ## Auth and models
 
-`ZHIPU_API_KEY` is forwarded into the container when set, which covers all four GLM providers (`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`):
+Two ways in, and you only need one.
+
+**Log in once (no env var afterwards):**
+
+```bash
+oc --login zai          # or: oc --login  (pick the provider from the list)
+```
+
+That runs opencode's own interactive login in the container and asks for the key. It is stored in the `credential` table of `config_dir/.local/share/opencode/opencode.db`, which is a mounted host path — so every later `oc` already has it and you never pass `-e` or export anything. `/connect` inside the TUI does the same thing. `oc auth list` shows what is stored, `oc auth logout` removes it.
+
+**Or forward an env var**, handy for CI or a throwaway shell:
 
 ```bash
 export ZHIPU_API_KEY=...
 oc --model zai/glm-5.3
 ```
 
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` and `OPENCODE_API_KEY` are forwarded the same way if present. Otherwise run `/connect` in the TUI once — credentials land in `config_dir/.local/share/opencode/auth.json` and persist.
+`ZHIPU_API_KEY` covers all four GLM providers (`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`); `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` and `OPENCODE_API_KEY` are forwarded the same way when present.
 
 `oc models` lists every `provider/model` id your key unlocks.
 
