@@ -68,7 +68,7 @@ alias oc='opencode-terminal-cli'
   workdir and can't touch your files. Config dir is still mounted, so auth and
   session resume keep working. Also adds `--cap-drop=ALL` and
   `--security-opt=no-new-privileges`. Combinable with `-i`.
-- `--read-only` — host cwd mounted `:ro` (`:ro,Z` under SELinux). Container can
+- `--read-only` — host cwd mounted `:ro`. Container can
   read your files but not write them. Config dir stays writable.
 
 ### Sessions
@@ -148,7 +148,7 @@ Auto-created on first run at `~/.config/opencode-terminal-cli/config.json`:
 | `image` | string | Container image to run |
 | `config_dir` | path | Host dir holding opencode's config and data. `config_dir/.config/opencode` and `config_dir/.local/share/opencode` are mounted into the container. Login, sessions, plugins persist here. |
 | `runtime` | `auto` / `docker` / `podman` | `auto` prefers podman if both installed |
-| `selinux` | `auto` / `on` / `off` | `auto` runs `getenforce`, adds `:Z` to mounts on enforcing/permissive |
+| `selinux` | `auto` / `on` / `off` | `auto` runs `getenforce`; on enforcing/permissive the container gets `--security-opt label=disable` |
 | `model` | string | Default model, overridden by `--model` |
 | `system_prompt_file` | path | Default extra system prompt file, overridden by `--system-prompt-file` |
 | `extra_args` | string[] | Extra args appended to runtime, e.g. `["--network=host"]` |

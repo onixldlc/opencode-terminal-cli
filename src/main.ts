@@ -201,10 +201,16 @@ function buildRunArgs(opts: {
   } = opts;
   const cwd = process.cwd();
 
-  const z = selinux ? ":Z" : "";
+  // NEVER use :Z/:z here. Those relabel the mount source recursively on the host,
+  // and the workdir can be any directory the user happens to be in — including $HOME.
+  // Relabeling a home dir with a container-private label locks other apps out of it,
+  // and it fails half-way on any root-owned file, leaving the tree inconsistent.
+  // Turning off label confinement for this container touches nothing on the host.
+  const z = "";
   // read-only applies to the workdir mount only — config stays writable
-  const workMnt = readOnly ? (selinux ? ":ro,Z" : ":ro") : z;
+  const workMnt = readOnly ? ":ro" : "";
   const args: string[] = ["run", "-it", "--rm"];
+  if (selinux) args.push("--security-opt", "label=disable");
 
   if (secure) {
     // least privilege: drop all caps, no privilege escalation
@@ -238,7 +244,7 @@ function buildRunArgs(opts: {
     const hostFile = resolve(systemPromptFile.replace(/^~/, homedir()));
     if (!existsSync(hostFile)) throw new Error(`system prompt file not found: ${hostFile}`);
     containerPromptFile = "/opencode-system-prompt.md";
-    args.push("-v", `${hostFile}:${containerPromptFile}${selinux ? ":ro,Z" : ":ro"}`);
+    args.push("-v", `${hostFile}:${containerPromptFile}:ro`);
   }
 
   // host.docker.internal isn't automatic on Linux — map it to the bridge gateway.
