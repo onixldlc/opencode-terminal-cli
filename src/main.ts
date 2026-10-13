@@ -20,6 +20,8 @@ type Config = {
   selinux: "auto" | "on" | "off";
   model: string;
   system_prompt_file: string;
+  retry: string;
+  retry_cap: string;
   extra_args: string[];
 };
 
@@ -30,6 +32,10 @@ const DEFAULT_CONFIG: Config = {
   selinux: "auto",
   model: "",
   system_prompt_file: "",
+  // retry attempts and the per-attempt ceiling in seconds. empty = the image's
+  // own defaults (200 attempts, 60s). set "5" and "30" for stock opencode.
+  retry: "",
+  retry_cap: "",
   extra_args: [],
 };
 
@@ -193,11 +199,14 @@ function buildRunArgs(opts: {
   model?: string;
   systemPrompt?: string;
   systemPromptFile?: string;
+  retry?: string;
+  retryCap?: string;
   publish?: string[];
 }): string[] {
   const {
     runtime, cfg, selinux, interactive, opencodeArgs,
-    secure = false, readOnly = false, model, systemPrompt, systemPromptFile, publish = [],
+    secure = false, readOnly = false, model, systemPrompt, systemPromptFile,
+    retry, retryCap, publish = [],
   } = opts;
   const cwd = process.cwd();
 
@@ -262,6 +271,14 @@ function buildRunArgs(opts: {
   for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY"]) {
     if (process.env[key]) args.push("-e", `${key}=${process.env[key]}`);
   }
+  // retry knobs for the image's retry proxy. forwarded when set on the host so
+  // `OC_RETRY_MAX=120 opencode-terminal` works without touching extra_args
+  for (const key of ["OC_RETRY_MAX", "OC_RETRY_CAP", "OC_RETRY_BASE", "OC_RETRY_DEADLINE", "OC_PROXY", "OC_PROXY_INSECURE"]) {
+    if (process.env[key]) args.push("-e", `${key}=${process.env[key]}`);
+  }
+  // --retry / --retry-cap win over the env. cap is seconds here, ms in the container
+  if (retry) args.push("-e", `OC_RETRY_MAX=${retry}`);
+  if (retryCap) args.push("-e", `OC_RETRY_CAP=${Number(retryCap) * 1000}`);
   if (model) args.push("-e", `OPENCODE_MODEL=${model}`);
   if (systemPrompt) args.push("-e", `OPENCODE_SYSTEM_PROMPT=${systemPrompt}`);
   if (containerPromptFile) args.push("-e", `OPENCODE_SYSTEM_PROMPT_FILE=${containerPromptFile}`);
@@ -294,6 +311,8 @@ Usage:
   ${BIN_NAME} --system-prompt <s>  Extra system prompt text for this run
   ${BIN_NAME} --system-prompt-file <f>
                                    Extra system prompt file for this run
+  ${BIN_NAME} --retry <n>          Retry a busy provider n times (image default 200)
+  ${BIN_NAME} --retry-cap <sec>    Ceiling between attempts (image default 60)
   ${BIN_NAME} --login [provider]   Log in once; the credential persists in config_dir
   ${BIN_NAME} --web [port]         Run \`opencode web\` and publish the port (default 4096)
   ${BIN_NAME} --secure             Don't mount cwd + least privilege (config still mounted)
@@ -430,10 +449,18 @@ async function main() {
   const model = takeOption(argv, "--model") ?? (cfg.model || undefined);
   const systemPrompt = takeOption(argv, "--system-prompt");
   const systemPromptFile = takeOption(argv, "--system-prompt-file") ?? (cfg.system_prompt_file || undefined);
+  const retry = takeOption(argv, "--retry") ?? (cfg.retry || undefined);
+  const retryCap = takeOption(argv, "--retry-cap") ?? (cfg.retry_cap || undefined);
+  for (const [flag, value] of [["--retry", retry], ["--retry-cap", retryCap]] as const) {
+    if (value !== undefined && !/^\d+$/.test(value)) {
+      console.error(`[${BIN_NAME}] ${flag} takes a whole number, got ${value}`);
+      process.exit(1);
+    }
+  }
 
   const runtime = detectRuntime(cfg.runtime);
   const selinux = detectSelinux(cfg.selinux);
-  const shared = { runtime, cfg, selinux, secure, readOnly, model, systemPrompt, systemPromptFile };
+  const shared = { runtime, cfg, selinux, secure, readOnly, model, systemPrompt, systemPromptFile, retry, retryCap };
 
   const run = (runArgs: string[]): never => {
     if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] cmd: ${runtime} ${runArgs.join(" ")}`);

@@ -125,6 +125,17 @@ oc --model zai/glm-5.3
 
 `ZHIPU_API_KEY` covers all four GLM providers (`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`); `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` and `OPENCODE_API_KEY` are forwarded the same way when present.
 
+`OC_RETRY_MAX`, `OC_RETRY_CAP`, `OC_RETRY_BASE`, `OC_RETRY_DEADLINE`, `OC_PROXY` and `OC_PROXY_INSECURE` are forwarded too — they tune the image's retry proxy, which absorbs a busy provider's 429s and 5xx so a turn isn't dropped after opencode's own five attempts. The image defaults to 200 attempts with a 60s ceiling (~3h 15m). For policy per provider, edit `retry.json` in the container's config dir — see the image README.
+
+Per run, `--retry` and `--retry-cap` (seconds) are shorter than the env vars and win over them:
+
+```bash
+opencode-terminal --retry 5 --retry-cap 30    # stock opencode: gives up after ~1 min
+opencode-terminal --retry 400                 # ~6h 40m, for a long unattended run
+```
+
+Set `retry` / `retry_cap` in the wrapper config to change the default for every run.
+
 `oc models` lists every `provider/model` id your key unlocks.
 
 ## Config
