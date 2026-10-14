@@ -78,8 +78,9 @@ function opencodeDbPath(cfg: Config): string {
 
 // sessions.json records, per host directory, every session that was started or
 // resumed from it, newest first. v1 of the file was a flat
-// `{ "<host cwd>": "<session id>" }` map holding only the last id, which made
-// `--sessions` unable to tell whose session was whose; it is migrated on read.
+// `{ "<host cwd>": "<session id>" }` map holding only the last id; it is
+// migrated on read. The list is never filtered by directory — this only feeds
+// the * marker and the host dir shown by -v.
 type DirRecord = { last: string; ids: string[] };
 type SessionMapV2 = { version: 2; dirs: Record<string, DirRecord> };
 
@@ -125,10 +126,6 @@ function rememberSessions(cfg: Config, cwd: string, ids: string[]): void {
   rec.ids = [...new Set([...ids, ...rec.ids])];
   map.dirs[cwd] = rec;
   saveSessions(cfg, map);
-}
-
-function idsForDir(cfg: Config, cwd: string): Set<string> {
-  return new Set(loadSessions(cfg).dirs[cwd]?.ids ?? []);
 }
 
 function dirForId(cfg: Config, id: string): string | undefined {
@@ -273,31 +270,24 @@ function stamp(d: Date): string {
   return d.toISOString().slice(0, 16).replace("T", " ");
 }
 
-function ago(d: Date): string {
-  const s = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
-  if (s < 86400 * 30) return `${Math.round(s / 86400)}d ago`;
-  return stamp(d);
-}
-
 // the id is `ses_` + a reverse-time prefix + random tail, so every session cut
 // in the same minute shares its first ~10 characters. this returns the shortest
 // prefix that is still unique across the shown set (never shorter than the
 // `ses_` + 12 timestamp characters, so it stays unambiguous after new sessions).
+function bareId(id: string): string {
+  return id.startsWith("ses_") ? id.slice(4) : id;
+}
+
 function shortIdLength(rows: SessionRow[]): number {
-  const min = 16;
-  for (let n = min; n <= 40; n++) {
-    const seen = new Set(rows.map(r => r.id.slice(0, n)));
+  for (let n = 8; n <= 40; n++) {
+    const seen = new Set(rows.map(r => bareId(r.id).slice(0, n)));
     if (seen.size === rows.length) return n;
   }
   return 40;
 }
 
 function oneLine(s: string, max: number): string {
-  const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
+  return s.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
 function msgCount(s: SessionRow): string {
@@ -312,8 +302,7 @@ const AUTO_TITLE = /^New session - \d{4}-\d{2}-\d{2}T/;
 function describe(s: SessionRow): string {
   if (s.preview) return oneLine(s.preview, 100);
   if (s.title && !AUTO_TITLE.test(s.title)) return oneLine(s.title, 100);
-  if (!s.detail) return "(no preview — this opencode stores messages elsewhere)";
-  return s.messages > 0 ? "(no user text)" : "(empty — never used)";
+  return "(no user message yet)";
 }
 
 // ──────────────── runtime detection ────────────────
@@ -463,9 +452,8 @@ function printHelp() {
 Usage:
   ${BIN_NAME}                      Resume last session in this dir (or start fresh)
   ${BIN_NAME} --new                Start a new session (don't resume)
-  ${BIN_NAME} --sessions           List this dir's sessions (slug, age, model, first line)
-  ${BIN_NAME} --sessions --all     List sessions from every directory
-  ${BIN_NAME} --sessions -v        Add the full id, start time, cost and host path
+  ${BIN_NAME} --sessions           List every session, newest activity first
+  ${BIN_NAME} --sessions -v        Add slug, message count, model, cost and host dir
   ${BIN_NAME} --sessions <slug>    Resume by slug (or by id / id prefix)
   ${BIN_NAME} --model <id>         Model for this run, e.g. zai/glm-5.3
   ${BIN_NAME} --system-prompt <s>  Extra system prompt text for this run
@@ -492,11 +480,12 @@ Isolation:
                write them. Config dir stays writable.
 
 Session tracking:
-  Per-directory. sessions.json in your config_dir records every session started
-  or resumed from a directory (an older file holding only the last id is
-  upgraded in place), which is what lets --sessions scope the list to this dir.
-  Sessions get a slug like 'swift-forest' from opencode — use it to resume, the
-  raw ids are reverse-time encoded so their prefixes all look the same.
+  --sessions lists every session, whichever directory it came from. The * marks
+  the one this directory auto-resumes; sessions.json in your config_dir records
+  which sessions came from where (-v prints it).
+  Resume by id prefix or by the slug opencode gives each session ('swift-forest'):
+  ids are reverse-time encoded, so their first characters all look alike and the
+  list prints the shortest prefix that is still unique.
   Sessions themselves are stored by opencode in
   config_dir/.local/share/opencode/opencode.db and resumed with 'opencode -s <id>'.
 
@@ -513,7 +502,7 @@ Default host config dir: ${DEFAULT_CONFIG.config_dir}
 `);
 }
 
-function printSessions(cfg: Config, cwd: string, verbose = false, all = false) {
+function printSessions(cfg: Config, cwd: string, verbose = false) {
   const sessions = listSessions(cfg);
   const last = getLastSessionId(cfg, cwd);
 
@@ -523,46 +512,24 @@ function printSessions(cfg: Config, cwd: string, verbose = false, all = false) {
     return;
   }
 
-  const mine = idsForDir(cfg, cwd);
-  const shown = all ? sessions : sessions.filter(s => mine.has(s.id));
-  const hidden = sessions.length - shown.length;
-
-  if (shown.length === 0) {
-    console.log(`no sessions recorded for ${cwd}.`);
-    console.log(`${sessions.length} session(s) exist elsewhere — ${BIN_NAME} --sessions --all`);
-    return;
-  }
-
-  const scope = all ? "all directories" : cwd;
-  console.log(`sessions — ${scope} (${shown.length}${all ? "" : ` of ${sessions.length}`}) — * = resumed by default here\n`);
+  console.log(`sessions (${sessions.length}) — * = last used here:\n`);
 
   const idLen = shortIdLength(sessions);
-  const slugWidth = Math.max(...shown.map(s => (s.slug || "-").length));
-  const ageWidth = Math.max(...shown.map(s => ago(s.active).length));
-  const msgWidth = Math.max(...shown.map(s => msgCount(s).length));
+  const width = process.stdout.columns && process.stdout.columns > 40 ? process.stdout.columns : 100;
+  // marker + id + "  " + "YYYY-MM-DD HH:MM" + "  " + preview
+  const room = Math.max(20, width - (2 + idLen + 2 + 16 + 2));
 
-  for (const s of shown) {
+  for (const s of sessions) {
     const marker = s.id === last ? "*" : " ";
-    const slug = (s.slug || "-").padEnd(slugWidth);
-    const meta = [
-      ago(s.active).padEnd(ageWidth),
-      msgCount(s).padEnd(msgWidth),
-      s.model || "",
-    ].join("  ").trimEnd();
-    console.log(`${marker} ${slug}  ${s.id.slice(0, idLen)}  ${meta}`);
-    console.log(`    ${describe(s)}`);
+    console.log(`${marker} ${bareId(s.id).slice(0, idLen)}  ${stamp(s.active)}  ${oneLine(describe(s), room)}`);
     if (verbose) {
-      const dir = dirForId(cfg, s.id) ?? "(not tracked — started before this was recorded)";
-      const cost = s.cost > 0 ? `  $${s.cost.toFixed(4)}` : "";
-      console.log(`    id ${s.id}`);
-      console.log(`    started ${stamp(s.created)}${cost}  ${dir}`);
+      const dir = dirForId(cfg, s.id) ?? "(dir not tracked)";
+      const bits = [s.slug || "-", msgCount(s), s.model, s.cost > 0 ? `$${s.cost.toFixed(4)}` : "", dir]
+        .filter(Boolean).join("  ");
+      console.log(`             ${bits}`);
     }
   }
-
-  if (hidden > 0) {
-    console.log(`\n${hidden} session(s) from other directories — ${BIN_NAME} --sessions --all`);
-  }
-  console.log(`\nresume: ${BIN_NAME} --sessions <slug-or-id>`);
+  console.log(`\nresume: ${BIN_NAME} --sessions <id-or-slug>`);
 }
 
 // accepts a slug ("swift-forest"), a full id, or any id prefix, with or without
@@ -581,7 +548,7 @@ function resolveSession(cfg: Config, want: string): string | null {
   console.error(`[${BIN_NAME}] '${want}' matches ${matches.length} sessions:`);
   const idLen = shortIdLength(matches);
   for (const m of matches) {
-    console.error(`  ${(m.slug || "-").padEnd(16)} ${m.id.slice(0, idLen)}  ${ago(m.active)}  ${oneLine(describe(m), 60)}`);
+    console.error(`  ${bareId(m.id).slice(0, idLen)}  ${(m.slug || "-").padEnd(16)}  ${oneLine(describe(m), 60)}`);
   }
   console.error(`use the slug, it is unique.`);
   process.exit(1);
@@ -649,18 +616,17 @@ async function main() {
   if (argv.includes("--sessions")) {
     // -v means "verbose listing" here; outside --sessions it is opencode's own --version
     const verbose = takeFlag(argv, "-v", "--verbose");
-    const all = takeFlag(argv, "--all", "-a");
     // the flags above are spliced out, so the index has to be read after them
     const idx = argv.indexOf("--sessions");
     const arg = argv[idx + 1];
     if (!arg || arg.startsWith("-")) {
-      printSessions(cfg, cwd, verbose, all);
+      printSessions(cfg, cwd, verbose);
       return;
     }
     const resolved = resolveSession(cfg, arg);
     if (!resolved) {
       console.error(`[${BIN_NAME}] no session matching '${arg}'`);
-      console.error(`[${BIN_NAME}] list them with: ${BIN_NAME} --sessions --all`);
+      console.error(`[${BIN_NAME}] list them with: ${BIN_NAME} --sessions`);
       process.exit(1);
     }
     argv.splice(idx, 2);

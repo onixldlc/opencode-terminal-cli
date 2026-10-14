@@ -36,9 +36,8 @@ bun run install-local   # → ~/.local/bin/opencode-terminal-cli
 ```bash
 opencode-terminal-cli                      # resume last session in this dir (or start fresh)
 opencode-terminal-cli --new                # start a new session (don't resume)
-opencode-terminal-cli --sessions           # list this dir's sessions
-opencode-terminal-cli --sessions --all     # list sessions from every directory
-opencode-terminal-cli --sessions <slug>    # resume by slug (or id / id prefix)
+opencode-terminal-cli --sessions           # list every session, newest first
+opencode-terminal-cli --sessions <id>      # resume by id prefix, full id or slug
 opencode-terminal-cli --model zai/glm-4.7  # model for this run
 opencode-terminal-cli --system-prompt "…"  # extra system prompt for this run
 opencode-terminal-cli --system-prompt-file ./reviewer.md
@@ -75,7 +74,8 @@ alias oc='opencode-terminal-cli'
 ### Sessions
 
 Per-directory session tracking. The CLI records every session started or resumed
-from a host directory and auto-resumes the newest one on the next run.
+from a host directory and auto-resumes the newest one on the next run. The list
+itself is never filtered — every session shows up wherever you run it from.
 
 ```bash
 cd ~/coding/project-a
@@ -84,27 +84,31 @@ oc                           # first run: creates a session
 
 oc                           # second run: auto-resumes it
 oc --new                     # ignore it, start fresh
-oc --sessions                # this dir's sessions, * marks the one that auto-resumes
-oc --sessions --all          # every session, whatever directory it came from
-oc --sessions swift-forest   # resume by slug
-oc --sessions -v             # add full id, start time, cost and host path
+oc --sessions                # list every session, * marks the one resumed here
+oc --sessions ec6b0c16       # resume by id prefix
+oc --sessions swift-forest   # or by slug
+oc --sessions -v             # add slug, message count, model, cost and host dir
 ```
 
 Session list output:
 
 ```
-sessions — /home/you/coding/project-a (2 of 7) — * = resumed by default here
+sessions (7) — * = last used here:
 
-* swift-forest    ses_ec6b0c16cffe  12m ago  34 msgs  zai/glm-5.3
-    fix the retry popup so it shows up again
-  playful-falcon  ses_ec6b0c19effe  2d ago    6 msgs  zai/glm-4.7
-    explain webpack loaders
+  ec6b0c19  2026-10-13 14:00  before you do anything what can you see ? like you can only see work f
+* ec6b0c16  2026-10-13 05:40  why the fk are you sending it ??? it should not be sent!!!
+  ec6b0c13  2026-10-11 06:26  yo quick, from the mcp build me a simple fps limiter... (allow user to
+  ec6b0c10  2026-10-08 22:53  hey build me an all in one dns server and client
+  ec6b0c07  2026-10-07 19:06  (no user message yet)
 ```
 
-Resume by the **slug**. opencode ids are `ses_` + a reverse-time prefix + a
-random tail, so every session cut in the same minute shares its first ~10
-characters — a short prefix is almost never unique. The list prints the shortest
-prefix that still is; the slug is shorter and unique anyway.
+The id column drops opencode's `ses_` prefix and prints the shortest tail that is
+still unique across the list — 8 characters unless two sessions genuinely collide
+there. Full ids look like `ses_ec942c6e4ffeCn7lZE1xEQlj0k`, where `ses_ec` and
+the `ffe` in the middle are the same for every session cut around the same time,
+so a raw prefix tells you nothing. Resuming accepts the short form, the full id,
+or the slug opencode assigns (`swift-forest`); an ambiguous prefix lists the
+candidates instead of guessing.
 
 opencode keeps sessions in SQLite, not one file per session, so the list is read
 from `config_dir/.local/share/opencode/opencode.db` (read-only; archived sessions
@@ -114,20 +118,19 @@ What each column comes from, verified against the 1.19.0 binary's own migrations
 
 | shown | source |
 |---|---|
-| slug | `session.slug` |
-| age | newest `message.time_created` for the session |
-| count | rows in `message` for the session |
-| model | `providerID`/`modelID` of the last assistant message |
-| description | first non-synthetic user text `part`, else the session title |
+| id | `session.id` minus `ses_`, cut to the shortest unique length |
+| timestamp | newest `message.time_created` for the session, else `session.time_created` |
+| preview | first non-synthetic user text `part`, else the session title |
 
-Not `session.time_updated`: opencode does not bump it when a message lands, and
-a projection rebuild restamps every row with the same value — which is why every
-session used to list as last used at the same minute.
+Not `session.time_updated`: opencode does not bump it when a message lands, and a
+projection rebuild restamps every row with the same value — which is why every
+session used to list as last used at the same minute. Not `session.title` either:
+an unnamed session's title is literally `New session - <ISO date>`.
 
 Inside the container the cwd is always `/home/dev/work`, so every host directory
 is the same opencode project — the host path mapping lives in
-`config_dir/sessions.json`. That file used to hold only the last id per
-directory; it is upgraded in place on first read.
+`config_dir/sessions.json`, which `-v` prints. That file used to hold only the
+last id per directory; it is upgraded in place on first read.
 
 ## Auth and models
 
