@@ -350,11 +350,12 @@ function buildRunArgs(opts: {
   retry?: string;
   retryCap?: string;
   publish?: string[];
+  runtimeArgs?: string[];
 }): string[] {
   const {
     runtime, cfg, selinux, interactive, opencodeArgs,
     secure = false, readOnly = false, model, systemPrompt, systemPromptFile,
-    retry, retryCap, publish = [],
+    retry, retryCap, publish = [], runtimeArgs = [],
   } = opts;
   const cwd = process.cwd();
 
@@ -432,6 +433,10 @@ function buildRunArgs(opts: {
   if (containerPromptFile) args.push("-e", `OPENCODE_SYSTEM_PROMPT_FILE=${containerPromptFile}`);
 
   args.push(...cfg.extra_args);
+  // --runtime-arg comes after extra_args on purpose: both end up in the same
+  // argv and docker/podman let a later flag win, so a one-off run can override
+  // whatever the config file set without editing it.
+  args.push(...runtimeArgs);
 
   if (interactive) {
     args.push("--entrypoint=/bin/bash");
@@ -463,6 +468,7 @@ Usage:
   ${BIN_NAME} --retry-cap <sec>    Ceiling between attempts (image default 60)
   ${BIN_NAME} --login [provider]   Log in once; the credential persists in config_dir
   ${BIN_NAME} --web [port]         Run \`opencode web\` and publish the port (default 4096)
+  ${BIN_NAME} --runtime-arg=<arg>  Forward one arg to docker/podman, repeatable
   ${BIN_NAME} --secure             Don't mount cwd + least privilege (config still mounted)
   ${BIN_NAME} --read-only          Mount cwd read-only
   ${BIN_NAME} -i, --shell          Drop into interactive bash inside container
@@ -471,6 +477,16 @@ Usage:
   ${BIN_NAME} --config             Print config file path and current values
   ${BIN_NAME} --edit-config        Open config in $EDITOR
   ${BIN_NAME} [...args]            Pass extra args to opencode (e.g. --version, models, stats)
+
+Runtime passthrough:
+  --runtime-arg=<arg>  Appended to the docker/podman command line, after
+                       extra_args from the config file, so it wins over them.
+                       One arg per occurrence; repeat the flag for more. Use the
+                       '=' form -- the value may start with '-'.
+                         ${BIN_NAME} --runtime-arg=--cap-add=NET_RAW -i
+                         ${BIN_NAME} --runtime-arg=--network=host
+                       Same effect as the config file's extra_args, but for a
+                       single run. OC_DEBUG=1 prints the command it builds.
 
 Isolation:
   --secure     Host cwd is not mounted — container gets an empty workdir.
@@ -569,6 +585,28 @@ function takeOption(argv: string[], flag: string): string | undefined {
   return value;
 }
 
+// Repeatable, and unlike takeOption the value is allowed to start with "-":
+// forwarding runtime flags is the entire point, so --cap-add=NET_RAW has to get
+// through. That makes a bare trailing "--runtime-arg" ambiguous with the next
+// flag, so a missing value is an error rather than something silently eaten.
+// One runtime arg per occurrence; repeat the flag for more. Prefer the
+// --runtime-arg=--flag=value form, it reads unambiguously.
+function takeOptionAll(argv: string[], flag: string): string[] {
+  const out: string[] = [];
+  for (;;) {
+    const i = argv.findIndex(a => a === flag || a.startsWith(`${flag}=`));
+    if (i === -1) return out;
+    const inline = argv[i]!.startsWith(`${flag}=`);
+    const value = inline ? argv[i]!.slice(flag.length + 1) : argv[i + 1];
+    if (value === undefined || value === "") {
+      console.error(`[${BIN_NAME}] ${flag} needs a value, e.g. ${flag}=--cap-add=NET_RAW`);
+      process.exit(1);
+    }
+    argv.splice(i, inline ? 1 : 2);
+    out.push(value);
+  }
+}
+
 function takeFlag(argv: string[], ...names: string[]): boolean {
   let found = false;
   for (const name of names) {
@@ -633,6 +671,10 @@ async function main() {
     resumeSession = resolved;
   }
 
+  // read before the other takers so a forwarded value like "--model" cannot be
+  // mistaken for this wrapper's own flag
+  const runtimeArgs = takeOptionAll(argv, "--runtime-arg");
+
   const secure = takeFlag(argv, "--secure");
   const readOnly = takeFlag(argv, "--read-only");
   const interactive = takeFlag(argv, "-i", "--shell");
@@ -652,7 +694,13 @@ async function main() {
 
   const runtime = detectRuntime(cfg.runtime);
   const selinux = detectSelinux(cfg.selinux);
-  const shared = { runtime, cfg, selinux, secure, readOnly, model, systemPrompt, systemPromptFile, retry, retryCap };
+  const shared = { runtime, cfg, selinux, secure, readOnly, model, systemPrompt, systemPromptFile, retry, retryCap, runtimeArgs };
+
+  // --secure drops every capability, so a --cap-add next to it is a no-op the
+  // user would otherwise debug for a while
+  if (secure && runtimeArgs.some(a => a.startsWith("--cap-add"))) {
+    console.error(`[${BIN_NAME}] warning: --secure adds --cap-drop=ALL, which overrides your --cap-add`);
+  }
 
   const run = (runArgs: string[]): never => {
     if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] cmd: ${runtime} ${runArgs.join(" ")}`);

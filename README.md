@@ -43,6 +43,7 @@ opencode-terminal-cli --system-prompt "…"  # extra system prompt for this run
 opencode-terminal-cli --system-prompt-file ./reviewer.md
 opencode-terminal-cli --login zai          # log in once, no -e needed afterwards
 opencode-terminal-cli --web 5000           # run `opencode web`, publish the port
+opencode-terminal-cli --runtime-arg=--cap-add=NET_RAW   # forward an arg to docker/podman
 opencode-terminal-cli --secure             # don't mount cwd + least privilege (config still mounted)
 opencode-terminal-cli --read-only          # mount cwd read-only
 opencode-terminal-cli -i                   # interactive bash inside container (debug, plugin install)
@@ -61,6 +62,49 @@ Tip: alias it short.
 ```bash
 alias oc='opencode-terminal-cli'
 ```
+
+### Runtime passthrough
+
+`--runtime-arg=<arg>` appends one argument to the `docker`/`podman` command line.
+Repeat it for more than one. Nothing else in the CLI claims unknown arguments for
+the runtime — anything it does not recognise goes to opencode — so this is the only
+way to reach the runtime for a single run.
+
+```bash
+# tcpdump inside the container needs CAP_NET_RAW
+opencode-terminal-cli --runtime-arg=--cap-add=NET_RAW -i
+
+# then, inside: the image ships sudo but not tcpdump
+sudo apt-get update && sudo apt-get install -y tcpdump
+sudo tcpdump -i any -w /home/dev/work/cap.pcap   # cwd is mounted, pcap lands on the host
+```
+
+Use the `=` form: the value usually starts with `-`, and that is explicitly
+allowed here. A runtime flag that takes a separate value needs one occurrence per
+token:
+
+```bash
+opencode-terminal-cli --runtime-arg=--cap-add --runtime-arg=NET_RAW
+```
+
+These are appended *after* `extra_args` from the config file, and both runtimes
+let the later flag win, so a one-off run can override the config without editing
+it. `OC_DEBUG=1` prints the full command that gets built.
+
+Three things that bite:
+
+- `--secure` adds `--cap-drop=ALL`, which overrides any `--cap-add` you pass. The
+  CLI warns when you combine them.
+- Docker's default capability set already includes `NET_RAW`; podman's does not.
+  Check with `podman info --format '{{.Host.Security.Capabilities}}'` before
+  blaming the flag.
+- Capabilities land in the bounding set, and under podman the container process is
+  your own uid (`--userns=keep-id`), which holds nothing effective. That is why
+  `tcpdump` needs the image's passwordless `sudo` and not just the capability.
+
+Note that model traffic is TLS. tcpdump gives you ciphertext; the image's retry
+proxy already terminates and re-originates every model call with its own CA in the
+container trust store, which is the decrypted tap and needs no capability at all.
 
 ### Isolation flags
 
@@ -190,7 +234,7 @@ Auto-created on first run at `~/.config/opencode-terminal-cli/config.json`:
 | `selinux` | `auto` / `on` / `off` | `auto` runs `getenforce`; on enforcing/permissive the container gets `--security-opt label=disable` |
 | `model` | string | Default model, overridden by `--model` |
 | `system_prompt_file` | path | Default extra system prompt file, overridden by `--system-prompt-file` |
-| `extra_args` | string[] | Extra args appended to runtime, e.g. `["--network=host"]` |
+| `extra_args` | string[] | Extra args appended to runtime, e.g. `["--network=host"]`. Same place `--runtime-arg` writes to, but permanent; `--runtime-arg` is appended after these and wins. |
 
 System prompts have three layers: this flag (per run), `config_dir/.config/opencode/AGENTS.md` (global, seeded by the image), and `AGENTS.md` in the project itself.
 
