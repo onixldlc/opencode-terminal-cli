@@ -36,8 +36,9 @@ bun run install-local   # → ~/.local/bin/opencode-terminal-cli
 ```bash
 opencode-terminal-cli                      # resume last session in this dir (or start fresh)
 opencode-terminal-cli --new                # start a new session (don't resume)
-opencode-terminal-cli --sessions           # list all sessions for this dir
-opencode-terminal-cli --sessions <id>      # resume specific session (id or prefix)
+opencode-terminal-cli --sessions           # list this dir's sessions
+opencode-terminal-cli --sessions --all     # list sessions from every directory
+opencode-terminal-cli --sessions <slug>    # resume by slug (or id / id prefix)
 opencode-terminal-cli --model zai/glm-4.7  # model for this run
 opencode-terminal-cli --system-prompt "…"  # extra system prompt for this run
 opencode-terminal-cli --system-prompt-file ./reviewer.md
@@ -73,7 +74,8 @@ alias oc='opencode-terminal-cli'
 
 ### Sessions
 
-Per-directory session tracking. The CLI remembers the last session id used in each host directory and auto-resumes on next run.
+Per-directory session tracking. The CLI records every session started or resumed
+from a host directory and auto-resumes the newest one on the next run.
 
 ```bash
 cd ~/coding/project-a
@@ -81,28 +83,51 @@ oc                           # first run: creates a session
 # ...do stuff, exit
 
 oc                           # second run: auto-resumes it
-oc --new                     # ignore last, start fresh
-oc --sessions                # list all sessions, * marks last used here
-oc --sessions ses_abc        # resume ses_abc12345 (prefix match)
-oc --sessions -v             # also print the host dir each session was used in
+oc --new                     # ignore it, start fresh
+oc --sessions                # this dir's sessions, * marks the one that auto-resumes
+oc --sessions --all          # every session, whatever directory it came from
+oc --sessions swift-forest   # resume by slug
+oc --sessions -v             # add full id, start time, cost and host path
 ```
 
 Session list output:
 
 ```
-sessions (3) — * = last used here:
+sessions — /home/you/coding/project-a (2 of 7) — * = resumed by default here
 
-* ses_abc1  2026-10-11 20:39  debug the auth middleware
-  ses_def6  2026-10-11 19:49  write a bun cli wrapper
-  ses_ghi0  2026-10-10 22:33  explain webpack loaders
+* swift-forest    ses_ec6b0c16cffe  12m ago  34 msgs  zai/glm-5.3
+    fix the retry popup so it shows up again
+  playful-falcon  ses_ec6b0c19effe  2d ago    6 msgs  zai/glm-4.7
+    explain webpack loaders
 ```
 
+Resume by the **slug**. opencode ids are `ses_` + a reverse-time prefix + a
+random tail, so every session cut in the same minute shares its first ~10
+characters — a short prefix is almost never unique. The list prints the shortest
+prefix that still is; the slug is shorter and unique anyway.
+
 opencode keeps sessions in SQLite, not one file per session, so the list is read
-from `config_dir/.local/share/opencode/opencode.db` (read-only, `session` table;
-archived sessions and subagent children are skipped) and resumed with
-`opencode -s <id>`. Inside the container the cwd is always `/home/dev/work`, so
-every host directory is the same opencode project — the host path mapping lives
-in `config_dir/sessions.json`.
+from `config_dir/.local/share/opencode/opencode.db` (read-only; archived sessions
+and subagent children are skipped) and resumed with `opencode -s <id>`.
+
+What each column comes from, verified against the 1.19.0 binary's own migrations:
+
+| shown | source |
+|---|---|
+| slug | `session.slug` |
+| age | newest `message.time_created` for the session |
+| count | rows in `message` for the session |
+| model | `providerID`/`modelID` of the last assistant message |
+| description | first non-synthetic user text `part`, else the session title |
+
+Not `session.time_updated`: opencode does not bump it when a message lands, and
+a projection rebuild restamps every row with the same value — which is why every
+session used to list as last used at the same minute.
+
+Inside the container the cwd is always `/home/dev/work`, so every host directory
+is the same opencode project — the host path mapping lives in
+`config_dir/sessions.json`. That file used to hold only the last id per
+directory; it is upgraded in place on first read.
 
 ## Auth and models
 

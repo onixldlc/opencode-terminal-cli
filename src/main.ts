@@ -76,69 +76,190 @@ function opencodeDbPath(cfg: Config): string {
 
 // ──────────────── session tracking ────────────────
 
-// sessions.json maps host cwd -> last session id
-type SessionMap = Record<string, string>;
+// sessions.json records, per host directory, every session that was started or
+// resumed from it, newest first. v1 of the file was a flat
+// `{ "<host cwd>": "<session id>" }` map holding only the last id, which made
+// `--sessions` unable to tell whose session was whose; it is migrated on read.
+type DirRecord = { last: string; ids: string[] };
+type SessionMapV2 = { version: 2; dirs: Record<string, DirRecord> };
 
 function sessionsFile(cfg: Config): string {
   return join(resolveHostConfig(cfg), "sessions.json");
 }
 
-function loadSessions(cfg: Config): SessionMap {
+function loadSessions(cfg: Config): SessionMapV2 {
   const f = sessionsFile(cfg);
-  if (!existsSync(f)) return {};
-  try { return JSON.parse(readFileSync(f, "utf8")); }
-  catch { return {}; }
+  const empty: SessionMapV2 = { version: 2, dirs: {} };
+  if (!existsSync(f)) return empty;
+  try {
+    const raw = JSON.parse(readFileSync(f, "utf8"));
+    if (raw && raw.version === 2 && raw.dirs) return raw as SessionMapV2;
+    // v1: flat cwd -> id
+    const dirs: Record<string, DirRecord> = {};
+    for (const [dir, id] of Object.entries(raw ?? {})) {
+      if (typeof id === "string") dirs[dir] = { last: id, ids: [id] };
+    }
+    return { version: 2, dirs };
+  } catch {
+    return empty;
+  }
 }
 
-function saveSessions(cfg: Config, map: SessionMap): void {
+function saveSessions(cfg: Config, map: SessionMapV2): void {
   const f = sessionsFile(cfg);
   mkdirSync(resolveHostConfig(cfg), { recursive: true });
   writeFileSync(f, JSON.stringify(map, null, 2));
 }
 
 function getLastSessionId(cfg: Config, cwd: string): string | null {
-  return loadSessions(cfg)[cwd] ?? null;
+  return loadSessions(cfg).dirs[cwd]?.last ?? null;
 }
 
-function setLastSessionId(cfg: Config, cwd: string, id: string): void {
+// remembers the ids as belonging to this directory, newest first, and makes the
+// first one the resume target
+function rememberSessions(cfg: Config, cwd: string, ids: string[]): void {
+  if (ids.length === 0) return;
   const map = loadSessions(cfg);
-  map[cwd] = id;
+  const rec = map.dirs[cwd] ?? { last: ids[0]!, ids: [] };
+  rec.last = ids[0]!;
+  rec.ids = [...new Set([...ids, ...rec.ids])];
+  map.dirs[cwd] = rec;
   saveSessions(cfg, map);
+}
+
+function idsForDir(cfg: Config, cwd: string): Set<string> {
+  return new Set(loadSessions(cfg).dirs[cwd]?.ids ?? []);
+}
+
+function dirForId(cfg: Config, id: string): string | undefined {
+  for (const [dir, rec] of Object.entries(loadSessions(cfg).dirs)) {
+    if (rec.ids.includes(id)) return dir;
+  }
+  return undefined;
 }
 
 // discover all sessions by reading opencode's own store
 // opencode keeps them in SQLite (<config_dir>/.local/share/opencode/opencode.db),
-// not one file per session, so this reads the `session` table read-only.
-// inside the container cwd is always /home/dev/work, so every host directory
-// lands in the same opencode project — the host path mapping lives in
+// not one file per session, so this reads it read-only. Verified against the
+// 1.19.0 binary's own migrations:
+//   session(id, slug, title, directory, time_created, time_updated, cost, ...)
+//   message(id, session_id, time_created, data json {role, modelID, providerID})
+//   part(id, message_id, time_created, data json {type, text, synthetic})
+// `session.time_updated` is NOT bumped when a message lands (checked live: it
+// still equalled time_created after a tool call) and a projection rebuild
+// restamps every row with the same value — which is why every session looked
+// like it was last used at the same minute. Activity is derived from `message`.
+// inside the container cwd is always /home/dev/work, so `session.directory` is
+// the same for every host directory; the host path mapping lives in
 // sessions.json instead.
-type SessionRow = { id: string; title: string; mtime: Date };
+type SessionRow = {
+  id: string;
+  slug: string;
+  title: string;
+  created: Date;
+  active: Date;      // last real activity: newest message, else created
+  messages: number;
+  model: string;     // "providerID/modelID" of the last assistant reply
+  cost: number;
+  preview: string;   // first thing the user actually typed
+  detail: boolean;   // false when the message tables could not be read
+};
+
+function openDb(cfg: Config): Database | null {
+  const db = opencodeDbPath(cfg);
+  if (!existsSync(db)) return null;
+  try {
+    return new Database(db, { readonly: true });
+  } catch (e) {
+    if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] could not open ${db}: ${e}`);
+    return null;
+  }
+}
 
 function listSessions(cfg: Config): SessionRow[] {
-  const db = opencodeDbPath(cfg);
-  if (!existsSync(db)) return [];
+  const conn = openDb(cfg);
+  if (!conn) return [];
   try {
-    const conn = new Database(db, { readonly: true });
+    const rows = conn
+      .query(
+        `SELECT id, slug, title, cost, time_created, time_updated
+           FROM session
+          WHERE parent_id IS NULL AND time_archived IS NULL`,
+      )
+      .all() as Array<{
+        id: string; slug: string | null; title: string | null;
+        cost: number | null; time_created: number; time_updated: number;
+      }>;
+
+    // message-derived columns. the table is optional as far as this wrapper is
+    // concerned — an opencode that renamed it should degrade, not crash.
+    const stats = new Map<string, { n: number; last: number }>();
+    const preview = new Map<string, string>();
+    const model = new Map<string, string>();
+    let detail = true;
     try {
-      const rows = conn
+      for (const r of conn
         .query(
-          `SELECT id, title, time_created, time_updated
-             FROM session
-            WHERE parent_id IS NULL AND time_archived IS NULL
-            ORDER BY time_updated DESC`,
+          `SELECT session_id AS sid, COUNT(*) AS n, MAX(time_created) AS last
+             FROM message GROUP BY session_id`,
         )
-        .all() as Array<{ id: string; title: string; time_created: number; time_updated: number }>;
-      return rows.map(r => ({
-        id: r.id,
-        title: r.title ?? "",
-        mtime: toDate(r.time_updated ?? r.time_created),
-      }));
-    } finally {
-      conn.close();
+        .all() as Array<{ sid: string; n: number; last: number }>) {
+        stats.set(r.sid, { n: r.n, last: r.last });
+      }
+      // first non-synthetic user text in each session — synthetic parts are the
+      // "The following tool was executed by the user" wrappers opencode injects
+      for (const r of conn
+        .query(
+          `SELECT m.session_id AS sid, json_extract(p.data, '$.text') AS text
+             FROM message m JOIN part p ON p.message_id = m.id
+            WHERE json_extract(m.data, '$.role') = 'user'
+              AND json_extract(p.data, '$.type') = 'text'
+              AND COALESCE(json_extract(p.data, '$.synthetic'), 0) = 0
+            ORDER BY m.time_created ASC, p.time_created ASC`,
+        )
+        .all() as Array<{ sid: string; text: string | null }>) {
+        if (!preview.has(r.sid) && r.text) preview.set(r.sid, r.text);
+      }
+      for (const r of conn
+        .query(
+          `SELECT session_id AS sid,
+                  json_extract(data, '$.providerID') AS provider,
+                  json_extract(data, '$.modelID')    AS model
+             FROM message
+            WHERE json_extract(data, '$.role') = 'assistant'
+            ORDER BY time_created DESC`,
+        )
+        .all() as Array<{ sid: string; provider: string | null; model: string | null }>) {
+        if (!model.has(r.sid) && r.model) model.set(r.sid, `${r.provider ?? "?"}/${r.model}`);
+      }
+    } catch (e) {
+      detail = false;
+      if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] no message detail: ${e}`);
     }
+
+    const out = rows.map(r => {
+      const st = stats.get(r.id);
+      const created = toDate(r.time_created);
+      return {
+        id: r.id,
+        slug: r.slug ?? "",
+        title: r.title ?? "",
+        created,
+        active: st ? toDate(st.last) : created,
+        messages: st?.n ?? 0,
+        model: model.get(r.id) ?? "",
+        cost: r.cost ?? 0,
+        preview: preview.get(r.id) ?? "",
+        detail,
+      };
+    });
+    out.sort((a, b) => b.active.getTime() - a.active.getTime());
+    return out;
   } catch (e) {
-    if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] could not read ${db}: ${e}`);
+    if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] could not read sessions: ${e}`);
     return [];
+  } finally {
+    conn.close();
   }
 }
 
@@ -148,13 +269,51 @@ function toDate(stamp: number): Date {
   return new Date(stamp < 1e12 ? stamp * 1000 : stamp);
 }
 
-function sessionMeta(cfg: Config, id: string): { hostCwd?: string } {
-  // host cwd — reverse lookup from sessions.json (container cwd is always /home/dev/work)
-  const map = loadSessions(cfg);
-  for (const [k, v] of Object.entries(map)) {
-    if (v === id) return { hostCwd: k };
+function stamp(d: Date): string {
+  return d.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function ago(d: Date): string {
+  const s = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  if (s < 86400 * 30) return `${Math.round(s / 86400)}d ago`;
+  return stamp(d);
+}
+
+// the id is `ses_` + a reverse-time prefix + random tail, so every session cut
+// in the same minute shares its first ~10 characters. this returns the shortest
+// prefix that is still unique across the shown set (never shorter than the
+// `ses_` + 12 timestamp characters, so it stays unambiguous after new sessions).
+function shortIdLength(rows: SessionRow[]): number {
+  const min = 16;
+  for (let n = min; n <= 40; n++) {
+    const seen = new Set(rows.map(r => r.id.slice(0, n)));
+    if (seen.size === rows.length) return n;
   }
-  return {};
+  return 40;
+}
+
+function oneLine(s: string, max: number): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
+}
+
+function msgCount(s: SessionRow): string {
+  if (!s.detail) return "";
+  if (s.messages === 0) return "empty";
+  return s.messages === 1 ? "1 msg" : `${s.messages} msgs`;
+}
+
+// the auto title opencode gives a session that was never named
+const AUTO_TITLE = /^New session - \d{4}-\d{2}-\d{2}T/;
+
+function describe(s: SessionRow): string {
+  if (s.preview) return oneLine(s.preview, 100);
+  if (s.title && !AUTO_TITLE.test(s.title)) return oneLine(s.title, 100);
+  if (!s.detail) return "(no preview — this opencode stores messages elsewhere)";
+  return s.messages > 0 ? "(no user text)" : "(empty — never used)";
 }
 
 // ──────────────── runtime detection ────────────────
@@ -304,9 +463,10 @@ function printHelp() {
 Usage:
   ${BIN_NAME}                      Resume last session in this dir (or start fresh)
   ${BIN_NAME} --new                Start a new session (don't resume)
-  ${BIN_NAME} --sessions           List all sessions for this dir
-  ${BIN_NAME} --sessions -v        List sessions with the host path they were used in
-  ${BIN_NAME} --sessions <id>      Resume specific session by id (or prefix)
+  ${BIN_NAME} --sessions           List this dir's sessions (slug, age, model, first line)
+  ${BIN_NAME} --sessions --all     List sessions from every directory
+  ${BIN_NAME} --sessions -v        Add the full id, start time, cost and host path
+  ${BIN_NAME} --sessions <slug>    Resume by slug (or by id / id prefix)
   ${BIN_NAME} --model <id>         Model for this run, e.g. zai/glm-5.3
   ${BIN_NAME} --system-prompt <s>  Extra system prompt text for this run
   ${BIN_NAME} --system-prompt-file <f>
@@ -332,7 +492,11 @@ Isolation:
                write them. Config dir stays writable.
 
 Session tracking:
-  Per-directory. Last session id stored in sessions.json in your config_dir.
+  Per-directory. sessions.json in your config_dir records every session started
+  or resumed from a directory (an older file holding only the last id is
+  upgraded in place), which is what lets --sessions scope the list to this dir.
+  Sessions get a slug like 'swift-forest' from opencode — use it to resume, the
+  raw ids are reverse-time encoded so their prefixes all look the same.
   Sessions themselves are stored by opencode in
   config_dir/.local/share/opencode/opencode.db and resumed with 'opencode -s <id>'.
 
@@ -349,7 +513,7 @@ Default host config dir: ${DEFAULT_CONFIG.config_dir}
 `);
 }
 
-function printSessions(cfg: Config, cwd: string, verbose = false) {
+function printSessions(cfg: Config, cwd: string, verbose = false, all = false) {
   const sessions = listSessions(cfg);
   const last = getLastSessionId(cfg, cwd);
 
@@ -359,29 +523,67 @@ function printSessions(cfg: Config, cwd: string, verbose = false) {
     return;
   }
 
-  console.log(`sessions (${sessions.length}) — * = last used here:\n`);
-  for (const s of sessions) {
+  const mine = idsForDir(cfg, cwd);
+  const shown = all ? sessions : sessions.filter(s => mine.has(s.id));
+  const hidden = sessions.length - shown.length;
+
+  if (shown.length === 0) {
+    console.log(`no sessions recorded for ${cwd}.`);
+    console.log(`${sessions.length} session(s) exist elsewhere — ${BIN_NAME} --sessions --all`);
+    return;
+  }
+
+  const scope = all ? "all directories" : cwd;
+  console.log(`sessions — ${scope} (${shown.length}${all ? "" : ` of ${sessions.length}`}) — * = resumed by default here\n`);
+
+  const idLen = shortIdLength(sessions);
+  const slugWidth = Math.max(...shown.map(s => (s.slug || "-").length));
+  const ageWidth = Math.max(...shown.map(s => ago(s.active).length));
+  const msgWidth = Math.max(...shown.map(s => msgCount(s).length));
+
+  for (const s of shown) {
     const marker = s.id === last ? "*" : " ";
-    const preview = (s.title || "(untitled session)").replace(/\s+/g, " ").slice(0, 80);
-    const short = s.id.slice(0, 8);
-    const when = s.mtime.toISOString().slice(0, 16).replace("T", " ");
-    console.log(`${marker} ${short}  ${when}  ${preview}`);
+    const slug = (s.slug || "-").padEnd(slugWidth);
+    const meta = [
+      ago(s.active).padEnd(ageWidth),
+      msgCount(s).padEnd(msgWidth),
+      s.model || "",
+    ].join("  ").trimEnd();
+    console.log(`${marker} ${slug}  ${s.id.slice(0, idLen)}  ${meta}`);
+    console.log(`    ${describe(s)}`);
     if (verbose) {
-      const meta = sessionMeta(cfg, s.id);
-      const path = meta.hostCwd ?? "(unknown — not tracked in sessions.json)";
-      console.log(`             path: ${path}`);
+      const dir = dirForId(cfg, s.id) ?? "(not tracked — started before this was recorded)";
+      const cost = s.cost > 0 ? `  $${s.cost.toFixed(4)}` : "";
+      console.log(`    id ${s.id}`);
+      console.log(`    started ${stamp(s.created)}${cost}  ${dir}`);
     }
   }
-  console.log(`\nresume: ${BIN_NAME} --sessions <id-or-prefix>`);
+
+  if (hidden > 0) {
+    console.log(`\n${hidden} session(s) from other directories — ${BIN_NAME} --sessions --all`);
+  }
+  console.log(`\nresume: ${BIN_NAME} --sessions <slug-or-id>`);
 }
 
-function resolveSessionByPrefix(cfg: Config, prefix: string): string | null {
+// accepts a slug ("swift-forest"), a full id, or any id prefix, with or without
+// the `ses_` part — ids are reverse-time encoded, so bare prefixes collide a lot
+// and the error has to show enough to tell the matches apart
+function resolveSession(cfg: Config, want: string): string | null {
   const all = listSessions(cfg);
-  const matches = all.filter(s => s.id.startsWith(prefix));
+  const exact = all.find(s => s.id === want || s.slug === want);
+  if (exact) return exact.id;
+
+  const bare = want.startsWith("ses_") ? want.slice(4) : want;
+  const matches = all.filter(s => s.id.startsWith(want) || s.id.slice(4).startsWith(bare) || s.slug.startsWith(want));
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0]!.id;
-  console.error(`[${BIN_NAME}] prefix '${prefix}' ambiguous (${matches.length} matches):`);
-  for (const m of matches) console.error(`  ${m.id}`);
+
+  console.error(`[${BIN_NAME}] '${want}' matches ${matches.length} sessions:`);
+  const idLen = shortIdLength(matches);
+  for (const m of matches) {
+    console.error(`  ${(m.slug || "-").padEnd(16)} ${m.id.slice(0, idLen)}  ${ago(m.active)}  ${oneLine(describe(m), 60)}`);
+  }
+  console.error(`use the slug, it is unique.`);
   process.exit(1);
 }
 
@@ -441,6 +643,30 @@ async function main() {
     return;
   }
 
+  // --sessions reads the host-side sqlite file, so both the listing and the
+  // "no such session" error are answered before detectRuntime() can throw
+  let resumeSession: string | undefined;
+  if (argv.includes("--sessions")) {
+    // -v means "verbose listing" here; outside --sessions it is opencode's own --version
+    const verbose = takeFlag(argv, "-v", "--verbose");
+    const all = takeFlag(argv, "--all", "-a");
+    // the flags above are spliced out, so the index has to be read after them
+    const idx = argv.indexOf("--sessions");
+    const arg = argv[idx + 1];
+    if (!arg || arg.startsWith("-")) {
+      printSessions(cfg, cwd, verbose, all);
+      return;
+    }
+    const resolved = resolveSession(cfg, arg);
+    if (!resolved) {
+      console.error(`[${BIN_NAME}] no session matching '${arg}'`);
+      console.error(`[${BIN_NAME}] list them with: ${BIN_NAME} --sessions --all`);
+      process.exit(1);
+    }
+    argv.splice(idx, 2);
+    resumeSession = resolved;
+  }
+
   const secure = takeFlag(argv, "--secure");
   const readOnly = takeFlag(argv, "--read-only");
   const interactive = takeFlag(argv, "-i", "--shell");
@@ -468,25 +694,11 @@ async function main() {
     process.exit(r.status ?? 1);
   };
 
-  // --sessions [id]
-  const sessionsIdx = argv.indexOf("--sessions");
-  if (sessionsIdx !== -1) {
-    // -v means "verbose listing" here; outside --sessions it is opencode's own --version
-    const verbose = takeFlag(argv, "-v", "--verbose");
-    const arg = argv[sessionsIdx + 1];
-    if (!arg || arg.startsWith("-")) {
-      printSessions(cfg, cwd, verbose);
-      return;
-    }
-    // resume specific
-    const resolved = resolveSessionByPrefix(cfg, arg);
-    if (!resolved) {
-      console.error(`[${BIN_NAME}] no session matching '${arg}'`);
-      process.exit(1);
-    }
-    setLastSessionId(cfg, cwd, resolved);
-    const rest = argv.filter((_, i) => i !== sessionsIdx && i !== sessionsIdx + 1);
-    run(buildRunArgs({ ...shared, interactive: false, opencodeArgs: ["-s", resolved, ...rest] }));
+  if (resumeSession) {
+    // resuming also claims the session for this directory, so the next bare run
+    // picks it up and the listing stops hiding it
+    rememberSessions(cfg, cwd, [resumeSession]);
+    run(buildRunArgs({ ...shared, interactive: false, opencodeArgs: ["-s", resumeSession, ...argv] }));
   }
 
   // --login [provider]: hand over to opencode's interactive login. The container
@@ -535,19 +747,20 @@ async function main() {
     console.error(`[${BIN_NAME}] cmd: ${runtime} ${runArgs.join(" ")}`);
   }
 
+  // snapshot first: a single run can create several sessions (the TUI's own
+  // "new session"), and all of them belong to this directory
+  const before = interactive ? new Set<string>() : new Set(listSessions(cfg).map(s => s.id));
+
   const result = spawnSync(runtime, runArgs, { stdio: "inherit" });
 
-  // after exit, if a new session was created, update tracking
-  // find most recent session, if different from what we resumed, save it
   if (!interactive) {
-    const sessions = listSessions(cfg);
-    if (sessions.length > 0) {
-      const newest = sessions[0]!.id;
-      const last = getLastSessionId(cfg, cwd);
-      if (newest !== last) {
-        setLastSessionId(cfg, cwd, newest);
-        if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] saved session ${newest} for ${cwd}`);
-      }
+    const after = listSessions(cfg);           // already newest-activity first
+    const fresh = after.filter(s => !before.has(s.id)).map(s => s.id);
+    const touched = after.length > 0 ? [after[0]!.id] : [];
+    const claim = [...new Set([...fresh, ...touched])];
+    if (claim.length > 0) {
+      rememberSessions(cfg, cwd, claim);
+      if (process.env.OC_DEBUG) console.error(`[${BIN_NAME}] claimed ${claim.join(", ")} for ${cwd}`);
     }
   }
 
